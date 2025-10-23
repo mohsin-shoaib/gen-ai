@@ -1,1 +1,7 @@
 mistral-7b-instruct-v0.1.Q4_K_M.gguf
+Ministral-3b-instruct.Q4_K_S
+faiss_index/
+query_log.txt
+venv/
+index.faiss
+index.pkl
