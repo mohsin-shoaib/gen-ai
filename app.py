@@ -2,12 +2,16 @@ import streamlit as st
 from streamlit_chat import message
 from langchain.chains import ConversationalRetrievalChain
 from langchain_community.document_loaders import TextLoader  # For loading MD file
-from langchain.embeddings import HuggingFaceEmbeddings
+from langchain_huggingface import HuggingFaceEmbeddings  # Updated import to address deprecation
 from langchain.llms import CTransformers
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.vectorstores import FAISS  # Updated import to avoid deprecation warning
 from langchain.memory import ConversationBufferMemory
+from langchain.prompts import PromptTemplate
 import os
+import re
+import torch  # Added for GPU detection (though not used here)
+import time  # For benchmarking (optional)
 
 # Function to load MD documents
 def load_documents(md_file_path='scraped_data/all_scraped_data.md'):
@@ -20,27 +24,73 @@ def load_documents(md_file_path='scraped_data/all_scraped_data.md'):
         doc.metadata['source'] = md_file_path
     return documents
 
-# Function to split text into chunks
+# Enhanced function to split text into chunks with metadata extraction
 def split_text_into_chunks(documents):
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
-    text_chunks = text_splitter.split_documents(documents)
-    return text_chunks
+    # Load raw text for parsing
+    raw_text = documents[0].page_content  # Assuming single MD file
+    
+    # Regex to extract sections (adapt patterns to your MD format)
+    section_pattern = r'###\s*(.*?)\n\*\*Organization:\*\*\s*(.*?)\n\*\*URL:\*\*\s*(.*?)\n\*\*Objective:\*\*\s*(.*?)(?=\n---\n###|\Z)'
+    sections = re.findall(section_pattern, raw_text, re.DOTALL | re.MULTILINE)
+    
+    chunks = []
+    for i, (title, org, url, content) in enumerate(sections):
+        # Split content into sub-chunks if long, preserving metadata
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=400, chunk_overlap=100)  # Smaller chunks for structure
+        sub_docs = text_splitter.create_documents([content])
+        
+        for sub_doc in sub_docs:
+            sub_doc.metadata.update({
+                'organization': org.strip(),
+                'url': url.strip(),
+                'section_type': title.strip(),  # e.g., "(Gym) clothing and shoes"
+                'source': 'all_scraped_data.md'
+            })
+            chunks.append(sub_doc)
+    
+    return chunks
 
-# Function to create embeddings
+# Enhanced function to create embeddings with multilingual model
 def create_embeddings():
-    embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2", model_kwargs={'device': "cpu"})
+    device = "cpu"  # Explicitly CPU since no GPU
+    embeddings = HuggingFaceEmbeddings(
+        model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",  # Multilingual, higher accuracy
+        model_kwargs={'device': device}
+    )
     return embeddings
 
-# Function to create vector store
-def create_vector_store(text_chunks, embeddings):
+# Function to create or load vector store with native FAISS persistence
+def create_or_load_vector_store(text_chunks, embeddings):
+    index_path = 'faiss_index'
+    if os.path.exists(index_path):
+        vector_store = FAISS.load_local(index_path, embeddings, allow_dangerous_deserialization=True)
+        st.info("Loaded pre-built FAISS index for faster startup.")
+        return vector_store
+    
+    # Fallback: Create new vector store
     vector_store = FAISS.from_documents(text_chunks, embeddings)
+    vector_store.save_local(index_path)
+    st.info("Created and saved new FAISS index.")
     return vector_store
 
-# Function to create LLMS model
+# Enhanced function to create LLMs model optimized for CPU with Mistral-7B
 def create_llms_model(model_path="./mistral-7b"):
+    # Determine physical cores for threading
+    physical_cores = len(os.sched_getaffinity(0)) // 2 if hasattr(os, 'sched_getaffinity') else os.cpu_count() // 2 or 4
+    
+    config = {
+        'max_new_tokens': 300,  # Increased for fuller responses
+        'temperature': 0.05,  # Lower for factual consistency
+        'gpu_layers': 0,  # Explicitly CPU-only
+        'threads': physical_cores,  # Optimize for CPU cores
+        'context_length': 4096,  # Increased to accommodate larger contexts
+        'top_k': 40,  # Limit sampling for speed
+        'top_p': 0.9
+    }
     llm = CTransformers(
         model=f"{model_path}/mistral-7b-instruct-v0.1.Q4_K_M.gguf",
-        config={'max_new_tokens': 128, 'temperature': 0.01}
+        model_type="mistral",  # Explicitly specify for stability
+        config=config
     )
     return llm
 
@@ -56,7 +106,7 @@ def load_and_process_data():
     documents = load_documents()
     text_chunks = split_text_into_chunks(documents)
     embeddings = create_embeddings()
-    vector_store = create_vector_store(text_chunks, embeddings)
+    vector_store = create_or_load_vector_store(text_chunks, embeddings)
     llm = create_llms_model()
     return vector_store, llm
 
@@ -75,19 +125,60 @@ if 'past' not in st.session_state:
 # Create memory
 memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
 
-# Create chain
-chain = ConversationalRetrievalChain.from_llm(
-    llm=llm,
-    chain_type='stuff',
-    retriever=vector_store.as_retriever(search_kwargs={"k": 2}),
-    memory=memory
-)
+# Enhanced custom prompt for completeness and structure
+template = """You are a helpful assistant for community services in Vught. Use the provided context to answer the question completely and accurately, focusing on key details like objectives, target audiences, missions, and contacts. Structure responses with bullets if multiple items are relevant. Limit to 200-250 words for brevity, but ensure all essential information is included without truncation. If no exact match, suggest related services.
 
-# Define chat function
+Context: {context}
+
+Question: {question}
+
+Complete Answer:"""
+QA_CHAIN_PROMPT = PromptTemplate.from_template(template)
+
+# Enhanced chain creation with MMR retriever and stuff chain type (compatible with custom prompt)
+@st.cache_resource
+def create_chain(_vector_store, _llm, _memory):
+    retriever = _vector_store.as_retriever(
+        search_type="mmr",  # Diversity in top-k results
+        search_kwargs={"k": 3, "fetch_k": 6, "lambda_mult": 0.5}  # Reduced fetch_k to fit context
+    )
+
+    chain = ConversationalRetrievalChain.from_llm(
+        llm=_llm,
+        chain_type='stuff',  # Use 'stuff' for compatibility with custom prompt; larger context handles it
+        retriever=retriever,
+        memory=_memory,
+        combine_docs_chain_kwargs={"prompt": QA_CHAIN_PROMPT}  # Enforce completeness
+    )
+    return chain
+
+chain = create_chain(vector_store, llm, memory)
+
+# Define chat function with truncation detection, retry, benchmarking, and logging
 def conversation_chat(query):
+    start_time = time.time()
     result = chain({"question": query, "chat_history": st.session_state['history']})
-    st.session_state['history'].append((query, result["answer"]))
-    return result["answer"]
+    end_time = time.time()
+    response_time = end_time - start_time
+    answer = result["answer"]
+    
+    # Detect potential truncation (heuristic: short length or incomplete punctuation)
+    if len(answer.split()) < 30 or not answer.strip().endswith(('.', '!', '?', '\n')):
+        st.warning("Initial response may be incomplete; regenerating with extended focus...")
+        # Retry with augmented query to encourage completeness
+        retry_result = chain({"question": f"{query} [Provide a complete, detailed response without truncation]", 
+                              "chat_history": st.session_state['history']})
+        answer = retry_result["answer"]
+        response_time = time.time() - start_time  # Update total time
+    
+    st.info(f"Response generated in {response_time:.2f} seconds.")
+    
+    # Enhanced logging
+    with open('query_log.txt', 'a') as f:
+        f.write(f"Query: {query}\nResponse: {answer}\nContext Length: {len(result.get('context', ''))}\n---\n")
+    
+    st.session_state['history'].append((query, answer))
+    return answer
 
 # Display chat history
 reply_container = st.container()
@@ -99,7 +190,8 @@ with container:
         submit_button = st.form_submit_button(label='Send')
 
     if submit_button and user_input:
-        output = conversation_chat(user_input)
+        with st.spinner('Processing your query...'):
+            output = conversation_chat(user_input)
         st.session_state['past'].append(user_input)
         st.session_state['generated'].append(output)
 

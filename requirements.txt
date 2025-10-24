@@ -1,0 +1,8 @@
+streamlit
+streamlit-chat
+langchain
+langchain-community
+ctransformers
+faiss-cpu
+sentence-transformers
+torch

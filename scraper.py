@@ -1,275 +1,273 @@
-import subprocess
-import json
-import os
+import requests
 import re
-from urllib.parse import urljoin, urlparse
-from datetime import datetime
 import time
+from typing import List, Dict, Any
 
-BASE_URL = 'https://voorzieningen.nl'
+# Headers to mimic a browser request
+HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+}
 
-VUGHT_ORG_FILTER = 'leergeld-vught'  # Retained for URL check logic, but not hardcoded in JSON
-
-def normalize_url(href):
-    if href.startswith('http'):
-        return href
-    return urljoin(BASE_URL, href)
-
-def fetch_page(url):
+def fetch_with_requests(url: str) -> str:
+    """
+    Fetches the content of the specified URL using requests.
+    :param url: The URL to fetch.
+    :return: The HTML content as a string.
+    """
     try:
-        cmd = ['curl', '-s', '-A', 'Mozilla/5.0 (compatible; Scraper)', url]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
-        result.check_returncode()
-        return result.stdout
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
-        print(f"Error fetching {url}: {error}")
-        return None
+        response = requests.get(url, headers=HEADERS, timeout=10)
+        response.raise_for_status()
+        return response.text
+    except requests.RequestException as error:
+        print(f'Error fetching content: {error}')
+        raise error
 
-def clean_text(text):
-    return re.sub(r'<.*?>', '', text).strip()
+def clean_translated_text(text: str) -> str:
+    """
+    Cleans HTML text by removing common translation wrappers like <font dir="auto" style="...">.
+    Repeatedly removes font tags until none left.
+    :param text: The text to clean.
+    :return: Cleaned text.
+    """
+    if not isinstance(text, str):
+        return ''
 
-def extract_details(html):
+    def remove_fonts(match):
+        inner = re.sub(r'<font[^>]*>', '', re.sub(r'</font>', '', match.group(0)))
+        return clean_translated_text(inner)
+
+    while True:
+        new_cleaned = re.sub(r'<font[^>]*>.*?</font>', remove_fonts, text, flags=re.DOTALL | re.IGNORECASE)
+        if new_cleaned == text:
+            break
+        text = new_cleaned
+
+    text = re.sub(r'<[^>]+>', '', text)  # Remove remaining tags
+    text = re.sub(r'\s+', ' ', text)  # Normalize whitespace
+    return text.strip()
+
+def extract_provisions_from_html(html: str) -> List[Dict[str, str]]:
+    """
+    Extracts individual provision objects {url, title, org} from the list page HTML using regular expressions.
+    :param html: The HTML content of the list page.
+    :return: Array of provision objects.
+    """
+    provisions = []
+    item_regex = re.compile(
+        r'<div class=["\']ResultaatItem["\']>[\s\S]*?<div class=["\']ResultaatTitel["\']><a href="([^"]+)"[^>]*name="anr1"[^>]*>([^<]+)</a></div>[\s\S]*?<span class=["\']notranslate["\']>([^<]+)</span>[\s\S]*?</div>',
+        re.DOTALL
+    )
+    for match in item_regex.finditer(html):
+        url = match.group(1).strip() if match.group(1) else ''
+        title = match.group(2).strip() if match.group(2) else ''
+        org = match.group(3).strip() if match.group(3) else ''
+        if url and title and org and not any(p['url'] == url for p in provisions):
+            provisions.append({'url': url, 'title': title, 'org': org})
+    return provisions
+
+def extract_total_provisions(html: str) -> int:
+    """
+    Extracts the total number of provisions from the list page HTML.
+    :param html: The HTML content of the list page.
+    :return: Total provisions count.
+    """
+    total_match = re.search(r'([\d,]+)\s+voorzieningen gevonden', html)
+    if total_match and total_match.group(1):
+        return int(total_match.group(1).replace(',', ''))
+    return 0
+
+def get_paginated_url(base_url: str, page_num: int) -> str:
+    """
+    Generates the paginated URL for a given page number.
+    :param base_url: The base URL.
+    :param page_num: The page number.
+    :return: The full URL for the page.
+    """
+    if page_num == 1:
+        return base_url
+    return f'{base_url}?p={page_num}'
+
+def extract_provision_details(html: str) -> Dict[str, Any]:
+    """
+    Extracts structured details from an individual provision page HTML.
+    Handles potential translation artifacts by cleaning text and flexible label matching with inner content.
+    Also extracts address/contact info from #dbsContactPane.
+    :param html: The HTML content.
+    :return: Details object with original language fields.
+    """
     details = {
-        'heading': '',
-        'description': '',
-        'visiting_address': '',
-        'persons': [],
-        'other_info': {},
-        'full_page_text': ''  # New field for all context
+        'title': '',
+        'org': '',
+        'purpose': '',
+        'moreInfo': '',
+        'targetGroup': '',
+        'mission': '',
+        'contact': {'visitingAddress': '', 'postalAddress': '', 'phone': '', 'email': '', 'website': ''}
     }
 
-    # Extract full page text for comprehensive context
-    # Target main content area; fallback to full cleaned HTML
-    main_content_match = re.search(r'<div id="dbsContent"[^>]*>(.*?)</div>', html, re.IGNORECASE | re.DOTALL)
-    if main_content_match:
-        details['full_page_text'] = clean_text(main_content_match.group(1))
-    else:
-        details['full_page_text'] = clean_text(html)
+    # Title
+    title_match = (re.search(r'<h1 class=["\']notranslate["\']>([^<]+)</h1>', html) or
+                   re.search(r'<title>([^<]+) - [^<]+ - Voorzieningen\.nl</title>', html))
+    if title_match and title_match.group(1):
+        details['title'] = clean_translated_text(title_match.group(1))
 
-    # Heading from <h1>
-    heading_match = re.search(r'<h1[^>]*>([^<]+)</h1>', html, re.IGNORECASE)
-    details['heading'] = heading_match.group(1).strip() if heading_match else ''
+    # Organization name
+    org_match = (re.search(r'<h2 class=["\']notranslate["\']><a[^>]*>([^<]+)</a></h2>', html) or
+                 re.search(r'<h2>([^<]+)</h2>', html))
+    if org_match and org_match.group(1):
+        details['org'] = clean_translated_text(org_match.group(1))
 
-    # Description: Doel and Toelichting
-    doel_match = re.search(r'<h3>Doel</h3>\s*<p>(.*?)</p>', html, re.IGNORECASE | re.DOTALL)
-    doel = clean_text(doel_match.group(1)) if doel_match else ''
-    toel_match = re.search(r'<h3>Toelichting</h3>\s*<p>(.*?)</p>', html, re.IGNORECASE | re.DOTALL)
-    toel = clean_text(toel_match.group(1)) if toel_match else ''
-    details['description'] = f"Doel: {doel}\nToelichting: {toel}"
+    # Purpose (Doel / Goal)
+    purpose_match = re.search(r'<h3>(Doel|Goal)</h3>\s*<span class=[\'"]doel[\'"]>([\s\S]*?)</span>', html, re.IGNORECASE)
+    if purpose_match and purpose_match.group(2):
+        details['purpose'] = clean_translated_text(purpose_match.group(2))
 
-    # Other info: Doelstelling
-    doelstelling_match = re.search(r'Doelstelling of kernactiviteit:</p>\s*<p>(.*?)</p>', html, re.IGNORECASE | re.DOTALL)
-    if doelstelling_match:
-        details['other_info']['doelstelling'] = clean_text(doelstelling_match.group(1))
+    # More information
+    more_info_match = re.search(r'<h3>(Meer informatie|More information)</h3>\s*<a href="([^"]+)"[^>]*>([^<]*)</a>', html, re.IGNORECASE)
+    if more_info_match:
+        details['moreInfo'] = clean_translated_text(more_info_match.group(3)) or more_info_match.group(2)
 
-    # Contact person details
-    persons = []
-    name_match = re.search(r'<h3>Contactpersoon</h3>\s*<p>Naam:\s*([^<]+?)(?=<br>|<p|$)', html, re.IGNORECASE | re.DOTALL)
-    name = name_match.group(1).strip() if name_match else ''
+    # Target Group (Doelgroep)
+    target_match = re.search(r'<h3>(Doelgroep|Target audience)</h3>\s*([\s\S]*?)(?=<h3>|</div>)', html, re.IGNORECASE)
+    if target_match and target_match.group(2):
+        details['targetGroup'] = clean_translated_text(target_match.group(2))
 
-    phone_matches = re.findall(r'Telefoonnummer:\s*<a\s+href="tel:([^"]+)"[^>]*>([^<]+?)</a>', html, re.IGNORECASE | re.DOTALL)
-    phone = ', '.join([match[1].strip() for match in phone_matches]) if phone_matches else ''
+    # Mission
+    mission_match = re.search(r'<b>(Doelstelling of kernactiviteit|Objective or core activity)[\s:]*</b>\s*<br>([\s\S]*?)</p>', html, re.IGNORECASE | re.DOTALL)
+    if mission_match and mission_match.group(2):
+        details['mission'] = clean_translated_text(mission_match.group(2))
 
-    email_matches = re.findall(r'E-mail:\s*<a\s+href="mailto:([^"]+)"[^>]*>([^<]+?)</a>', html, re.IGNORECASE | re.DOTALL)
-    email = ', '.join([match[1].strip() for match in email_matches]) if email_matches else ''
+    # Extract contact information from dbsContactPane
+    contact_section_match = re.search(r'<div[^>]*id=[\'"]dbsContactPane[\'"][^>]*>([\s\S]*?)</div>\s*</div>\s*</div>', html, re.IGNORECASE | re.DOTALL)
+    if contact_section_match and contact_section_match.group(1):
+        contact_html = contact_section_match.group(1)
 
-    if name and (phone or email):
-        persons.append({
-            'name': name,
-            'phone': phone,
-            'email': email
-        })
+        # Visiting address
+        visiting_section = re.search(r'<b[^>]*>(Visiting address|Bezoekadres):</b>([\s\S]*?)(?=<b|</div>)', contact_html, re.IGNORECASE | re.DOTALL)
+        if visiting_section and visiting_section.group(2):
+            lines = re.sub(r'<br\s*?/?>', ', ', visiting_section.group(2))
+            lines = re.sub(r'<[^>]+>', '', lines)
+            lines = re.sub(r'\s+', ' ', lines)
+            details['contact']['visitingAddress'] = lines.strip()
 
-    # Addresses
-    # Adres (visiting)
-    address_match = re.search(r'<p><b>Adres:</b>?\s*<br ?/?>\s*([^<]+?)(?:<br ?/?><span[^>]*>([^<]+?)</span>)?</p>', html, re.IGNORECASE | re.DOTALL)
-    if address_match:
-        street = address_match.group(1).strip()
-        city_post = address_match.group(2).strip() if address_match.group(2) else ''
-        details['visiting_address'] = f"{street}, {city_post}" if city_post else street
+        # Postal address
+        postal_section = re.search(r'<b[^>]*>(Postal address|Postadres):</b>([\s\S]*?)(?=<b|</div>)', contact_html, re.IGNORECASE | re.DOTALL)
+        if postal_section and postal_section.group(2):
+            lines = re.sub(r'<br\s*?/?>', ', ', postal_section.group(2))
+            lines = re.sub(r'<[^>]+>', '', lines)
+            lines = re.sub(r'\s+', ' ', lines)
+            details['contact']['postalAddress'] = lines.strip()
 
-    # Bezoekadres alternative
-    if not details['visiting_address']:
-        bezoek_match = re.search(r'<p>Bezoekadres:</p>\s*<p>([^<]+)</p>\s*<p>([^<]+)</p>', html, re.IGNORECASE | re.DOTALL)
-        if bezoek_match:
-            details['visiting_address'] = f"{bezoek_match.group(1).strip()}, {bezoek_match.group(2).strip()}"
+        # Phone number
+        phone_match = re.search(r'<b[^>]*>(Phone number|Telefoonnummer):</b>\s*([^<]+)', contact_html, re.IGNORECASE)
+        if phone_match and phone_match.group(2):
+            details['contact']['phone'] = clean_translated_text(phone_match.group(2))
 
-    # Postal Address
-    postal_match = re.search(r'<p><b>Postadres:</b>?\s*<br ?/?>\s*([^<]+?)(?:<br ?/?><span[^>]*>([^<]+?)</span>)?</p>', html, re.IGNORECASE | re.DOTALL)
-    postal_address = ''
-    if postal_match:
-        street = postal_match.group(1).strip()
-        city_post = postal_match.group(2).strip() if postal_match.group(2) else ''
-        postal_address = f"{street}, {city_post}" if city_post else street
-    else:
-        # Alternative for Postadres
-        post_alt_match = re.search(r'<p>Postadres:</p>\s*<p>([^<]+)</p>\s*<p>([^<]+)</p>', html, re.IGNORECASE | re.DOTALL)
-        if post_alt_match:
-            postal_address = f"{post_alt_match.group(1).strip()}, {post_alt_match.group(2).strip()}"
+        # Email
+        email_match = re.search(r'mailto:([^"\']+)', contact_html, re.IGNORECASE)
+        if email_match:
+            details['contact']['email'] = email_match.group(1).strip()
 
-    if postal_address:
-        for person in persons:
-            person['postal_address'] = postal_address
-        if not persons:
-            # Add to org if no person
-            persons.append({'postal_address': postal_address})
-
-    # Website
-    website_match = re.search(r'Website:\s*<a\s+href="([^"]+)"[^>]*>([^<]+?)</a>', html, re.IGNORECASE | re.DOTALL)
-    website = website_match.group(1).strip() if website_match else ''
-    if website:
-        for person in persons:
-            person['website'] = website
-        if not persons:
-            persons.append({'website': website})
-
-    # Fallback: Organizational details if no person
-    if not persons:
-        title_match = re.search(r'<title[^>]*>([^<]+)</title>', html, re.IGNORECASE)
-        org_name = details['heading'] or (title_match.group(1).split(' - ')[0].strip() if title_match else 'Unknown Organization')
-
-        org_phone_matches = re.findall(r'<p[^>]*>Telefoonnummer:\s*([^\s<]+(?:\s-[^\s<]+)?)</p>', html, re.IGNORECASE)
-        org_phone = ', '.join([p.strip() for p in org_phone_matches]) if org_phone_matches else ''
-
-        org_email_match = re.search(r'E-mailadres:\s*<a\s+href="mailto:([^"]+)"[^>]*>([^<]+?)</a>', html, re.IGNORECASE | re.DOTALL)
-        org_email = org_email_match.group(1).strip() if org_email_match else ''
-
-        persons.append({
-            'name': org_name,
-            'phone': org_phone,
-            'email': org_email,
-            'address': details['visiting_address'],
-            'postal_address': postal_address,
-            'website': website
-        })
-
-    details['persons'] = persons
+        # Website
+        website_match = re.search(r'<a[^>]+href="(https?://[^"]+)"[^>]*>\s*(?:www\.[^<]+|[^<]+)</a>', contact_html, re.IGNORECASE)
+        if website_match:
+            details['contact']['website'] = website_match.group(1).strip()
 
     return details
 
-def append_to_md_file(main_topic, sub_topic, location, wpid, detail_url, details):
-    folder_path = os.path.join(os.getcwd(), 'scraped_data')
-    os.makedirs(folder_path, exist_ok=True)
-    filename = os.path.join(folder_path, 'all_scraped_data.md')
+def append_provision_to_md(file_path: str, provision: Dict[str, str], details: Dict[str, Any]) -> None:
+    """
+    Appends a markdown section for a provision to the file using extracted details in original language.
+    :param file_path: The MD file path.
+    :param provision: The provision object with url, title, org.
+    :param details: The extracted details.
+    """
+    md_content = f'\n### {details["title"]}\n'
+    md_content += f'**Organisatie:** {details["org"]}\n'
+    md_content += f'**URL:** {provision["url"]}\n'
 
-    # Slug for reference
-    slug = os.path.basename(detail_url).replace('.html', '')
+    if details['purpose']:
+        md_content += f'\n**Doel:** {details["purpose"]}\n'
+    if details['moreInfo']:
+        md_content += f'\n**Meer informatie:** {details["moreInfo"]}\n'
+    if details['targetGroup']:
+        md_content += f'\n**Doelgroep:** {details["targetGroup"]}\n'
+    if details['mission']:
+        md_content += f'\n**Missie:** {details["mission"]}\n'
 
-    # Format as Markdown section
-    md_content = f"""
+    md_content += '\n**Contactinformatie:**\n'
+    if details['contact']['visitingAddress']:
+        md_content += f'- Bezoekadres: {details["contact"]["visitingAddress"]}\n'
+    if details['contact']['postalAddress']:
+        md_content += f'- Postadres: {details["contact"]["postalAddress"]}\n'
+    md_content += f'- Telefoon: {details["contact"]["phone"] or "N.v.t."}\n'
+    md_content += f'- E-mail: {details["contact"]["email"] or "N.v.t."}\n'
+    md_content += f'- Website: {details["contact"]["website"] or "N.v.t."}\n'
+    md_content += '\n---\n'  # Separator
 
-# {main_topic}
+    with open(file_path, 'a', encoding='utf-8') as f:
+        f.write(md_content)
 
-## Subtopic: {sub_topic}
+def fetch_and_save_all_provisions(initial_url: str) -> None:
+    """
+    Fetches content from the initial list page, extracts provision links dynamically across all paginated pages,
+    fetches full details for each unique provision, and appends to a single .md file in original language.
+    :param initial_url: The initial list page URL.
+    """
+    md_file_path = 'scraped_data/all_scraped_data.md'
+    processed_urls = set()  # To track unique provisions
+    page_num = 1
+    has_more_pages = True
+    total_provisions = 0
 
-### Detail: {slug}
+    try:
+        print('Fetching initial list page to determine total...')
+        initial_content = fetch_with_requests(initial_url)
+        total_provisions = extract_total_provisions(initial_content)
+        print(f'Total provisions found: {total_provisions}')
 
-| Field          | Value                  |
-|----------------|------------------------|
-| Name           | {details.get('persons', [{}])[0].get('name', 'N/A')} |
-| Phone          | {details.get('persons', [{}])[0].get('phone', 'N/A')} |
-| Email          | {details.get('persons', [{}])[0].get('email', 'N/A')} |
-| Visiting Address | {details.get('visiting_address', 'N/A')} |
-| Postal Address | {details.get('persons', [{}])[0].get('postal_address', 'N/A')} |
-| Website        | {details.get('persons', [{}])[0].get('website', 'N/A')} |
+        # Initialize MD file
+        with open(md_file_path, 'w', encoding='utf-8') as f:
+            f.write('# Alle Voorzieningen Details (in originele taal)\n\n')
 
-**Heading:** {details.get('heading', 'N/A')}
+        while has_more_pages:
+            page_url = get_paginated_url(initial_url, page_num)
+            print(f'\nFetching page {page_num}: {page_url}')
+            page_content = fetch_with_requests(page_url)
+            page_provisions = extract_provisions_from_html(page_content)
 
-**Description:** {details.get('description', 'N/A')}
+            print(f'Page {page_num} yielded {len(page_provisions)} provisions.')
 
-**Other Info:** {details.get('other_info', {})}
+            if len(page_provisions) == 0:
+                has_more_pages = False
+                print('No more provisions; stopping pagination.')
+            else:
+                # Process each new provision
+                for prov in page_provisions:
+                    if prov['url'] not in processed_urls:
+                        processed_urls.add(prov['url'])
+                        try:
+                            print(f'Processing unique provision: {prov["title"]} by {prov["org"]}')
+                            full_content = fetch_with_requests(prov['url'])
+                            details = extract_provision_details(full_content)
+                            append_provision_to_md(md_file_path, prov, details)
+                            print(f'Added details for {details["title"]} (Total processed: {len(processed_urls)}).')
+                        except Exception as error:
+                            print(f'Failed to process {prov["title"]}: {error}')
 
-**Full Page Text (All Context):** {details.get('full_page_text', 'N/A')}
+                        # Delay for details fetch
+                        time.sleep(1)
 
-**Full Data:**\n```json\n{json.dumps(details, indent=2, ensure_ascii=False)}\n```
+                page_num += 1
+                # Delay between pages
+                time.sleep(2)
 
-**Source URL:** {detail_url}
+        print(f'\nAll {len(processed_urls)} unique provisions processed and saved to {md_file_path}.')
+    except Exception as error:
+        print(f'Error in fetch_and_save_all_provisions: {error}')
+        raise error
 
----
-
-*Scraped on: {datetime.now().isoformat()}*"""
-
-    # Check if file exists; if not, add initial header
-    if not os.path.exists(filename):
-        header = f"# Scraped Data for {main_topic} - Filtered to {location} Municipality (wpid={wpid})\n\n"
-        with open(filename, 'w', encoding='utf-8') as f:
-            f.write(header + md_content)
-    else:
-        with open(filename, 'a', encoding='utf-8') as f:
-            f.write(md_content)
-
-    print(f"    Appended structured entry for {slug} to: {filename}")
-
-def scrape_site():
-    print('Starting scrape of main page...')
-    
-    main_url = f'{BASE_URL}/bewegen/aanbod.html?wpid=2093'
-    main_html = fetch_page(main_url)
-    if not main_html:
-        print('Failed to fetch main page. Exiting.')
-        return
-    
-    print(f'Fetched main page successfully.')
-    
-    # Extract dynamic metadata from main_html and main_url
-    # Main topic from title
-    title_match = re.search(r'<title[^>]*>([^<]+)</title>', main_html, re.IGNORECASE)
-    main_topic = clean_text(title_match.group(1)) if title_match else 'Bewegen & Ontmoeten'
-    
-    # Sub topic from <B>Lokale voorzieningen (XXX)</B>
-    sub_match = re.search(r'<B>([^<]+?)\s*\(\d+\)</B>', main_html, re.IGNORECASE)
-    sub_topic = clean_text(sub_match.group(1)) if sub_match else 'Lokale voorzieningen'
-    
-    # Location: search for Vught in context
-    loc_match = re.search(r'Vught', main_html)
-    location = 'Vught' if loc_match else 'Unknown Location'
-    
-    # WPID from URL
-    wpid_match = re.search(r'wpid=(\d+)', main_url)
-    wpid = wpid_match.group(1) if wpid_match else '2093'
-    
-    print(f'Extracted metadata: Main Topic="{main_topic}", Sub Topic="{sub_topic}", Location="{location}", WPID="{wpid}"')
-    
-    detail_links = []
-    # Extract detail links from ResultaatTitel divs
-    detail_pattern = r'<div\s+class=[\'"]ResultaatTitel[\'"]>\s*<a\s+href="([^"]+)"[^>]*>.*?</a>\s*</div>'
-    matches = re.findall(detail_pattern, main_html, re.IGNORECASE | re.DOTALL)
-    for href in matches:
-        if '/organisatie/' in href:
-            full_href = normalize_url(href)
-            if full_href not in detail_links:
-                detail_links.append(full_href)
-    
-    print(f'Extracted {len(detail_links)} detail links from main page.')
-    
-    print(f'Processing {len(detail_links)} detail links under sub-topic: {sub_topic}')
-
-    all_entries = []  # Optional: Collect for summary if needed
-
-    processed_links = detail_links
-    for detail_url in processed_links:
-        # Ensure domain restriction
-        if not urlparse(detail_url).netloc.endswith('voorzieningen.nl'):
-            print(f'  Skipping non-domain link: {detail_url}')
-            continue
-
-        print(f'  Processing detail: {detail_url}')
-        time.sleep(1)  # Rate limiting
-
-        detail_html = fetch_page(detail_url)
-        if not detail_html:
-            continue
-
-        details = extract_details(detail_html)
-        if details['persons'] or details['heading']:
-            print(f'    Details found for {main_topic} > {sub_topic}: {details.get("heading", "N/A")}')
-            append_to_md_file(main_topic, sub_topic, location, wpid, detail_url, details)
-            all_entries.extend(details['persons'])
-        else:
-            print(f'    No details extracted from {detail_url}')
-
-    print(f'\nScraping completed. Structured data saved to ./scraped_data/all_scraped_data.md')
-    print(f'Total contacts extracted: {len(all_entries)}')
-
+# Usage
 if __name__ == '__main__':
-    scrape_site()
+    initial_url = 'https://voorzieningen.nl/totaal/aanbod.html'
+    fetch_and_save_all_provisions(initial_url)
