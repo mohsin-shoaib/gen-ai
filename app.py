@@ -79,11 +79,11 @@ def create_llms_model(model_path="./mistral-7b"):
     physical_cores = len(os.sched_getaffinity(0)) // 2 if hasattr(os, 'sched_getaffinity') else os.cpu_count() // 2 or 4
     
     config = {
-        'max_new_tokens': 60,  # Even shorter for precision
+        'max_new_tokens': 300,  # Increased for fuller responses
         'temperature': 0.05,  # Lower for factual consistency
         'gpu_layers': 0,  # Explicitly CPU-only
         'threads': physical_cores,  # Optimize for CPU cores
-        'context_length': 2048,  # Limit context to reduce KV cache overhead
+        'context_length': 4096,  # Increased to accommodate larger contexts
         'top_k': 40,  # Limit sampling for speed
         'top_p': 0.9
     }
@@ -125,49 +125,60 @@ if 'past' not in st.session_state:
 # Create memory
 memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
 
-# Enhanced custom prompt for brevity and structure
-template = """You are a helpful assistant for community services in Vught. Use the provided context to answer the question concisely, focusing on key details like objectives, target audiences, missions, and contacts. Structure responses with bullets if multiple items are relevant. If no exact match, suggest related services.
+# Enhanced custom prompt for completeness and structure
+template = """You are a helpful assistant for community services in Vught. Use the provided context to answer the question completely and accurately, focusing on key details like objectives, target audiences, missions, and contacts. Structure responses with bullets if multiple items are relevant. Limit to 200-250 words for brevity, but ensure all essential information is included without truncation. If no exact match, suggest related services.
 
 Context: {context}
 
 Question: {question}
 
-Concise Answer (limit to 150 words):"""
+Complete Answer:"""
 QA_CHAIN_PROMPT = PromptTemplate.from_template(template)
 
-# Enhanced chain creation with MMR retriever
+# Enhanced chain creation with MMR retriever and stuff chain type (compatible with custom prompt)
 @st.cache_resource
 def create_chain(_vector_store, _llm, _memory):
     retriever = _vector_store.as_retriever(
         search_type="mmr",  # Diversity in top-k results
-        search_kwargs={"k": 3, "fetch_k": 10, "lambda_mult": 0.5}  # Fetch more, then rank
+        search_kwargs={"k": 3, "fetch_k": 6, "lambda_mult": 0.5}  # Reduced fetch_k to fit context
     )
 
     chain = ConversationalRetrievalChain.from_llm(
         llm=_llm,
-        chain_type='stuff',
+        chain_type='stuff',  # Use 'stuff' for compatibility with custom prompt; larger context handles it
         retriever=retriever,
         memory=_memory,
-        combine_docs_chain_kwargs={"prompt": QA_CHAIN_PROMPT}  # Enforce brevity
+        combine_docs_chain_kwargs={"prompt": QA_CHAIN_PROMPT}  # Enforce completeness
     )
     return chain
 
 chain = create_chain(vector_store, llm, memory)
 
-# Define chat function with optional benchmarking and logging
+# Define chat function with truncation detection, retry, benchmarking, and logging
 def conversation_chat(query):
     start_time = time.time()
     result = chain({"question": query, "chat_history": st.session_state['history']})
     end_time = time.time()
     response_time = end_time - start_time
-    st.info(f"Response generated in {response_time:.2f} seconds.")  # Optional feedback
+    answer = result["answer"]
     
-    # Simple logging
+    # Detect potential truncation (heuristic: short length or incomplete punctuation)
+    if len(answer.split()) < 30 or not answer.strip().endswith(('.', '!', '?', '\n')):
+        st.warning("Initial response may be incomplete; regenerating with extended focus...")
+        # Retry with augmented query to encourage completeness
+        retry_result = chain({"question": f"{query} [Provide a complete, detailed response without truncation]", 
+                              "chat_history": st.session_state['history']})
+        answer = retry_result["answer"]
+        response_time = time.time() - start_time  # Update total time
+    
+    st.info(f"Response generated in {response_time:.2f} seconds.")
+    
+    # Enhanced logging
     with open('query_log.txt', 'a') as f:
-        f.write(f"Query: {query}\nResponse: {result['answer']}\n---\n")
+        f.write(f"Query: {query}\nResponse: {answer}\nContext Length: {len(result.get('context', ''))}\n---\n")
     
-    st.session_state['history'].append((query, result["answer"]))
-    return result["answer"]
+    st.session_state['history'].append((query, answer))
+    return answer
 
 # Display chat history
 reply_container = st.container()
