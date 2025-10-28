@@ -24,26 +24,38 @@ def load_documents(md_file_path='scraped_data/all_scraped_data.md'):
         doc.metadata['source'] = md_file_path
     return documents
 
-# Enhanced function to split text into chunks with metadata extraction
+# Enhanced function to split text into chunks with metadata extraction, focused on key fields
 def split_text_into_chunks(documents):
     # Load raw text for parsing
     raw_text = documents[0].page_content  # Assuming single MD file
     
-    # Regex to extract sections (adapt patterns to your MD format)
-    section_pattern = r'###\s*(.*?)\n\*\*Organization:\*\*\s*(.*?)\n\*\*URL:\*\*\s*(.*?)\n\*\*Objective:\*\*\s*(.*?)(?=\n---\n###|\Z)'
+    # Improved regex to match the structure: ### Title, then **Field:** values, until next ### or end
+    # Captures: title, organization, url, purpose, target_audience, mission, contact_info
+    section_pattern = r'###\s*(.*?)\n\*\*Organization:\*\*\s*(.*?)\n\*\*URL:\*\*\s*(.*?)\n\*\*Purpose:\*\*\s*(.*?)\n\*\*Target audience:\*\*\s*(.*?)\n\*\*Mission:\*\*\s*(.*?)\n\*\*Contact information:\*\*\s*(.*?)(?=\n###|\Z)'
     sections = re.findall(section_pattern, raw_text, re.DOTALL | re.MULTILINE)
     
     chunks = []
-    for i, (title, org, url, content) in enumerate(sections):
-        # Split content into sub-chunks if long, preserving metadata
-        text_splitter = RecursiveCharacterTextSplitter(chunk_size=400, chunk_overlap=100)  # Smaller chunks for structure
-        sub_docs = text_splitter.create_documents([content])
+    for i, (title, org, url, purpose, target_audience, mission, contact_info) in enumerate(sections):
+        # Clean up fields (remove JS artifacts or extra text if present)
+        purpose = re.sub(r'function\s*teVinden\(\).*?Last modified:.*', '', purpose, flags=re.DOTALL).strip()
+        target_audience = re.sub(r'function\s*teVinden\(\).*?Last modified:.*', '', target_audience, flags=re.DOTALL).strip()
+        
+        # Create a structured chunk combining all key fields for semantic similarity
+        structured_content = f"Service: {title}\nOrganization: {org.strip()}\nURL: {url.strip()}\nPurpose: {purpose}\nTarget Audience: {target_audience}\nMission: {mission.strip()}\nContact Information: {contact_info.strip()}"
+        
+        # Use smaller splitter for the structured content to ensure key fields stay intact
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=150)  # Adjusted for structured content
+        sub_docs = text_splitter.create_documents([structured_content])
         
         for sub_doc in sub_docs:
             sub_doc.metadata.update({
                 'organization': org.strip(),
                 'url': url.strip(),
-                'section_type': title.strip(),  # e.g., "(Gym) clothing and shoes"
+                'purpose': purpose,
+                'target_audience': target_audience,
+                'mission': mission.strip(),
+                'contact_info': contact_info.strip(),
+                'section_type': title.strip(),  # e.g., "Bicycle"
                 'source': 'all_scraped_data.md'
             })
             chunks.append(sub_doc)
@@ -79,12 +91,12 @@ def create_llms_model(model_path="./mistral-7b"):
     physical_cores = len(os.sched_getaffinity(0)) // 2 if hasattr(os, 'sched_getaffinity') else os.cpu_count() // 2 or 4
     
     config = {
-        'max_new_tokens': 300,  # Increased for fuller responses
-        'temperature': 0.05,  # Lower for factual consistency
+        'max_new_tokens': 150,  # Reduced for faster generation
+        'temperature': 0.1,  # Slightly higher for minor speed gains in sampling
         'gpu_layers': 0,  # Explicitly CPU-only
         'threads': physical_cores,  # Optimize for CPU cores
-        'context_length': 4096,  # Increased to accommodate larger contexts
-        'top_k': 40,  # Limit sampling for speed
+        'context_length': 2048,  # Reduced to lower memory and processing overhead
+        'top_k': 20,  # Reduced for faster sampling
         'top_p': 0.9
     }
     llm = CTransformers(
@@ -125,8 +137,10 @@ if 'past' not in st.session_state:
 # Create memory
 memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
 
-# Enhanced custom prompt for completeness and structure
-template = """You are a helpful assistant for community services in Vught. Use the provided context to answer the question completely and accurately, focusing on key details like objectives, target audiences, missions, and contacts. Structure responses with bullets if multiple items are relevant. Limit to 200-250 words for brevity, but ensure all essential information is included without truncation. If no exact match, suggest related services.
+# Enhanced custom prompt for paragraph-style responses, emphasizing exact info extraction
+template = """You are a helpful assistant for community services in Vught. Match the user's question to the most relevant service by focusing on its Purpose (what the service provides), Target Audience (who qualifies, e.g., low-income families aged 4-17), and Mission (overall goals like participation opportunities). Use the context to provide accurate, fast guidance on facilities.
+
+Prioritize exact matches: If the question relates to eligibility (e.g., age, income), highlight Target Audience details in the response. For what the service offers, emphasize Purpose details. For broader support, reference Mission details. Respond in a single, cohesive paragraph that directly answers the question with exact information, integrating service name, key details, eligibility, goals, and contact info where relevant. Do not use bullets or lists; weave the information naturally into the paragraph for a conversational flow. If multiple services match, briefly describe the top 1-2 in sequence within the paragraph. Suggest alternatives if no exact match. Keep responses concise (100-150 words) but complete and precise, like a knowledgeable chatbot providing targeted help.
 
 Context: {context}
 
@@ -140,7 +154,7 @@ QA_CHAIN_PROMPT = PromptTemplate.from_template(template)
 def create_chain(_vector_store, _llm, _memory):
     retriever = _vector_store.as_retriever(
         search_type="mmr",  # Diversity in top-k results
-        search_kwargs={"k": 3, "fetch_k": 6, "lambda_mult": 0.5}  # Reduced fetch_k to fit context
+        search_kwargs={"k": 2, "fetch_k": 4, "lambda_mult": 0.5}  # Reduced for faster retrieval
     )
 
     chain = ConversationalRetrievalChain.from_llm(
@@ -154,7 +168,8 @@ def create_chain(_vector_store, _llm, _memory):
 
 chain = create_chain(vector_store, llm, memory)
 
-# Define chat function with truncation detection, retry, benchmarking, and logging
+# Define chat function with adjusted truncation detection for speed
+# Modified to return answer and response_time
 def conversation_chat(query):
     start_time = time.time()
     result = chain({"question": query, "chat_history": st.session_state['history']})
@@ -162,26 +177,35 @@ def conversation_chat(query):
     response_time = end_time - start_time
     answer = result["answer"]
     
-    # Detect potential truncation (heuristic: short length or incomplete punctuation)
-    if len(answer.split()) < 30 or not answer.strip().endswith(('.', '!', '?', '\n')):
-        st.warning("Initial response may be incomplete; regenerating with extended focus...")
-        # Retry with augmented query to encourage completeness
-        retry_result = chain({"question": f"{query} [Provide a complete, detailed response without truncation]", 
-                              "chat_history": st.session_state['history']})
-        answer = retry_result["answer"]
-        response_time = time.time() - start_time  # Update total time
-    
-    st.info(f"Response generated in {response_time:.2f} seconds.")
+    # Less aggressive truncation detection to avoid unnecessary retries (threshold increased)
+    # if len(answer.split()) < 20 or not answer.strip().endswith(('.', '!', '?', '\n')):
+    #     st.warning("Initial response may be incomplete; regenerating with extended focus...")
+    #     # Retry with augmented query to encourage completeness
+    #     retry_start = time.time()
+    #     retry_result = chain({"question": f"{query} [Provide a complete, detailed response without truncation]", 
+    #                           "chat_history": st.session_state['history']})
+    #     answer = retry_result["answer"]
+    #     retry_end = time.time()
+    #     response_time = retry_end - start_time  # Update total time
+    #     result = retry_result  # Update for logging
     
     # Enhanced logging
     with open('query_log.txt', 'a') as f:
         f.write(f"Query: {query}\nResponse: {answer}\nContext Length: {len(result.get('context', ''))}\n---\n")
     
     st.session_state['history'].append((query, answer))
-    return answer
+    return answer, response_time
+
+# Chat UI
+reply_container = st.container()
 
 # Display chat history
-reply_container = st.container()
+if st.session_state['generated']:
+    with reply_container:
+        for i in range(len(st.session_state['generated'])):
+            message(st.session_state["past"][i], is_user=True, key=str(i) + '_user', avatar_style="thumbs")
+            message(st.session_state["generated"][i], key=str(i), avatar_style="fun-emoji")
+
 container = st.container()
 
 with container:
@@ -190,13 +214,24 @@ with container:
         submit_button = st.form_submit_button(label='Send')
 
     if submit_button and user_input:
-        with st.spinner('Processing your query...'):
-            output = conversation_chat(user_input)
+        # New submission: append and display immediately
+        current_len = len(st.session_state['past'])
         st.session_state['past'].append(user_input)
-        st.session_state['generated'].append(output)
-
-if st.session_state['generated']:
-    with reply_container:
-        for i in range(len(st.session_state['generated'])):
-            message(st.session_state["past"][i], is_user=True, key=str(i) + '_user', avatar_style="thumbs")
-            message(st.session_state["generated"][i], key=str(i), avatar_style="fun-emoji")
+        st.session_state['generated'].append("Processing your query...")
+        
+        # Immediately display the new user and processing message
+        with reply_container:
+            message(user_input, is_user=True, key=str(current_len) + '_user', avatar_style="thumbs")
+            message("Processing your query...", key=str(current_len), avatar_style="fun-emoji")
+        
+        # Process the query
+        output, response_time = conversation_chat(user_input)
+        
+        # Update the last generated response
+        st.session_state['generated'][-1] = output
+        
+        # Show response time info
+        st.info(f"Response generated in {response_time:.2f} seconds.")
+        
+        # Rerun to update the display with the final response
+        st.rerun()
